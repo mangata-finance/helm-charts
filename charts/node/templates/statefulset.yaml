@@ -1,0 +1,227 @@
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: {{ include "node.name" . }}
+  labels: {{- include "node.labels" . | nindent 4 }}
+    service: {{ include "node.name" . }}
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      {{- include "node.selectorLabels" . | nindent 6 }}
+      service: {{ include "node.name" . }}
+  serviceName: {{ include "node.name" . }}
+  template:
+    metadata:
+      labels:
+        {{- include "node.labels" . | nindent 8 }}
+        service: {{ include "node.name" . }}
+    spec:
+      initContainers:
+        {{- if or .Values.customChainspecUrl .Values.relaychain.customChainspecUrl}}
+        - name: download-chainspec
+          image: {{ .Values.initContainer.image.repository }}:{{ .Values.initContainer.image.tag }}
+          command: [ "/bin/sh" ]
+          args:
+            - -c
+            - |
+              set -eux -o pipefail
+              {{- if .Values.customChainspecUrl }}
+              {{- if not .Values.forceDownloadChainspec }}
+              if [ ! -f {{ .Values.customChainspecPath }} ]; then
+              {{- end }}
+                wget -O {{ .Values.customChainspecPath }} {{ .Values.customChainspecUrl }}
+              {{- if not .Values.forceDownloadChainspec }}
+              fi
+              {{- end }}
+              {{- end }}
+              {{- if .Values.relaychain.customChainspecUrl }}
+              {{- if not .Values.forceDownloadChainspec }}
+              if [ ! -f {{ .Values.relaychain.chainspecPath }} ]; then
+              {{- end }}
+                wget -O {{ .Values.relaychain.chainspecPath }} {{ .Values.relaychain.customChainspecUrl }}
+              {{- if not .Values.forceDownloadChainspec }}
+              fi
+              {{- end }}
+              {{- end }}
+          volumeMounts:
+            - mountPath: /chain-data
+              name: chain-data
+            - mountPath: /relaychain-data
+              name: relaychain-data
+          securityContext:
+            runAsUser: 0
+        {{- else }}
+        - name: chainspec-generator
+          image: {{ .Values.relaychain.image | quote }}
+          command: ["/bin/bash"]
+          args: 
+            - -c
+            - /usr/bin/polkadot build-spec --chain={{ .Values.relaychain.chain }} --disable-default-bootnode --raw > {{ .Values.relaychain.chainspecPath }}
+          volumeMounts:
+            - mountPath: /relaychain-data
+              name: relaychain-data
+          securityContext:
+            runAsUser: 0
+        - name: export-genesis-wasm-and-state
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          command: ["/bin/bash"]
+          args: 
+            - -c
+            - |
+              set -eu
+              {{ .Values.command }} export-genesis-state --chain={{ .Values.chain }} > /chain-data/genesis-state
+              {{ .Values.command }} export-genesis-wasm --chain={{ .Values.chain }} > /chain-data/genesis-wasm
+          volumeMounts:
+            - mountPath: /chain-data
+              name: chain-data
+        {{- end }}
+        - name: inject-keys
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          command: ["/bin/bash"]
+          args:
+            - -c
+            - |
+              set -eu
+              {{- range $keys := .Values.accountKeys }}
+              if [ ! -f /var/run/secrets/{{ .type }}/type ]; then
+                 echo "Error: File /var/run/secrets/{{ .type }}/type does not exist"
+                 exit 1
+              fi
+              {{ $.Values.command }} key insert --chain {{ if $.Values.customChainspecUrl }}{{ $.Values.customChainspecPath }}{{ else }}{{ $.Values.chain }}{{ end }} \
+              --keystore-path /chain-data/keystore \
+              --key-type $(cat /var/run/secrets/{{ .type }}/type) \
+              --scheme $(cat /var/run/secrets/{{ .type }}/scheme) \
+              --suri /var/run/secrets/{{ .type }}/seed \
+              && echo "Inserted key {{ .type }} into Keystore" \
+              || echo "Failed to insert key {{ .type }} into Keystore."
+              {{- end }}
+              {{- /* Generate node key`*/}}
+              NODE_KEY_PATH="/chain-data/keystore/node-key"
+              if [ -f "${NODE_KEY_PATH}" ]; then
+                echo "Node key already exists, skipping node key generation"
+              else
+                {{ .Values.command }} key generate-node-key --file ${NODE_KEY_PATH} \
+                && echo "Generated node key into Keystore" \
+                || echo "Failed to generate and insert node key into Keystore."
+              fi
+          volumeMounts:
+            - mountPath: /chain-data
+              name: chain-data
+          {{- range $keys := .Values.accountKeys }}
+            - mountPath: /var/run/secrets/{{ .type }}
+              name: {{ .type }}
+          {{- end }}
+      containers:
+        - name: node
+          image: "{{ .Values.image.repository}}:{{ .Values.image.tag }}"
+          imagePullPolicy: Always
+          command:
+            # parachain
+            - {{ .Values.command }}
+            - --name={{ include "node.name" . }}
+            - --chain={{ if .Values.customChainspecUrl }}{{ .Values.customChainspecPath }}{{ else }}{{ .Values.chain }}{{ end }}
+            {{- if .Values.isCollator }}
+            - --collator
+            {{- end }}
+            {{- if .Values.bootnodeAddr }}
+            - --bootnodes={{ .Values.bootnodeAddr }}
+            {{- end }}
+            {{- if .Values.remoteCluster }}
+            - --public-addr=/dns4/{{ include "node.name" . }}-{{ .Values.environment }}.{{ .Values.domainZone }}/tcp/30333
+            {{- end }}
+            {{- if .Values.customNodeKey }}
+            - --node-key={{ .Values.customNodeKey }}
+            {{- else }}
+            - --node-key-file=/chain-data/keystore/node-key
+            {{- end }}
+            - --execution=wasm
+            - --keystore-path=/chain-data/keystore
+            - --base-path=/chain-data
+            - --port=30333
+            - --ws-port=9944
+            - --rpc-port=9933
+            - --prometheus-port=9716
+            - --unsafe-ws-external
+            - --unsafe-rpc-external
+            - --prometheus-external
+            - --rpc-methods=Unsafe
+            - --rpc-cors=all
+            {{- range .Values.flags }}
+            - {{ . }}
+            {{- end }}
+            - --
+            # relaychain
+            {{- if .Values.relaychain.bootnodeAddr }}
+            - --bootnodes={{ .Values.relaychain.bootnodeAddr }}
+            {{- end }}
+            - --chain={{ .Values.relaychain.chainspecPath }}
+            - --base-path=/relaychain-data
+            - --execution=wasm
+            {{- range .Values.relaychain.flags }}
+            - {{ . }}
+            {{- end }}
+          ports:
+            - containerPort: 9716
+            - containerPort: 9944
+            - containerPort: 30333
+            - containerPort: 40333
+          env:
+            {{- range $key, $val := .Values.env }}
+            - name: {{ $key }}
+              value: {{ $val }}
+            {{- end }}
+          resources:
+          {{- toYaml .Values.resources | nindent 12 }}
+          volumeMounts:
+            - mountPath: /chain-data
+              name: chain-data            
+            - mountPath: /relaychain-data
+              name: relaychain-data
+        {{- if .Values.parachainRegisterSidecar.enable }}
+        - name: parachain-register-sidecar
+          image: mangatasolutions/parachain-register:1.0
+          command: ['bash', '-c', 'node index.js']
+          env:
+            - name: STATE_FILE
+              value: /chain-data/genesis-state
+            - name: WASM_FILE
+              value: /chain-data/genesis-wasm
+            - name: COLLATOR_ADDR
+              value: {{ .Values.parachainRegisterSidecar.relaychainHostAddr | quote }}
+            - name: PARA_ID
+              value:  {{ .Values.parachainRegisterSidecar.parachainId | quote }}
+          volumeMounts:
+            - mountPath: /chain-data
+              name: chain-data
+        {{- end }}
+      volumes:
+      {{- range $keys := .Values.accountKeys }}
+        - name: {{ .type }}
+          secret:
+            secretName: {{ include "node.name" $ }}-{{ .type }}
+            defaultMode: 0400
+      {{- end }}
+  volumeClaimTemplates:
+    - metadata:
+        name: chain-data
+      spec:
+        storageClassName: {{ .Values.storageClass }}
+        accessModes: ["ReadWriteOnce"]
+        resources:
+          requests:
+            storage: {{ .Values.storageSize }}
+    - metadata:
+        name: relaychain-data
+      spec:
+        storageClassName: {{ .Values.storageClass }}
+        accessModes: ["ReadWriteOnce"]
+        {{- if .Values.relaychain.kubernetesVolumeSnapshot }}
+        dataSource:
+          name: {{ .Values.relaychain.kubernetesVolumeSnapshot }}
+          kind: VolumeSnapshot
+          apiGroup: snapshot.storage.k8s.io
+        {{- end }}
+        resources:
+          requests:
+            storage: {{ .Values.relaychain.storageSize }}

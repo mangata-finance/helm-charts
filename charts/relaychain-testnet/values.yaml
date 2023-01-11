@@ -1,0 +1,22 @@
+# Default values for mangata-node.
+# This is a YAML-formatted file.
+# Declare variables to be passed into your templates.
+env: local
+domainZone: mangata.online
+remoteCluster: false
+nameOverride: ''
+
+image: "parity/polkadot:v0.9.29"
+
+chain: rococo-local
+storageSize: 10Gi
+env_vars:
+  RUST_LOG: info
+
+resources:
+  requests:
+    cpu: 200m
+    memory: 1Gi
+  limits:
+    cpu: 1000m
+    memory: 2Gi
